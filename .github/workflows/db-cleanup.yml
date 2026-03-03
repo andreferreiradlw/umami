@@ -1,0 +1,48 @@
+name: Database Cleanup
+
+on:
+  schedule:
+    - cron: '0 3 * * 0' # Every Sunday at 3:00 AM UTC
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete analytics data older than 3 months
+        env:
+          DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: |
+          psql "$DATABASE_URL" <<'SQL'
+          DO $$
+          DECLARE
+            cutoff timestamptz := NOW() - INTERVAL '3 months';
+            r RECORD;
+          BEGIN
+            DELETE FROM event_data WHERE created_at < cutoff;
+            GET DIAGNOSTICS r.count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from event_data', r.count;
+
+            DELETE FROM session_data WHERE created_at < cutoff;
+            GET DIAGNOSTICS r.count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from session_data', r.count;
+
+            DELETE FROM revenue WHERE created_at < cutoff;
+            GET DIAGNOSTICS r.count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from revenue', r.count;
+
+            DELETE FROM website_event WHERE created_at < cutoff;
+            GET DIAGNOSTICS r.count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from website_event', r.count;
+
+            DELETE FROM session WHERE created_at < cutoff;
+            GET DIAGNOSTICS r.count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from session', r.count;
+          END $$;
+          SQL
+
+      - name: Vacuum tables to reclaim disk space
+        env:
+          DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: |
+          psql "$DATABASE_URL" -c "VACUUM website_event, event_data, session_data, session, revenue;"
