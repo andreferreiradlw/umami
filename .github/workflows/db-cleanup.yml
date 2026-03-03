@@ -17,27 +17,27 @@ jobs:
           DO $$
           DECLARE
             cutoff timestamptz := NOW() - INTERVAL '3 months';
-            r RECORD;
+            deleted_count integer;
           BEGIN
             DELETE FROM event_data WHERE created_at < cutoff;
-            GET DIAGNOSTICS r.count = ROW_COUNT;
-            RAISE NOTICE 'Deleted % rows from event_data', r.count;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from event_data', deleted_count;
 
             DELETE FROM session_data WHERE created_at < cutoff;
-            GET DIAGNOSTICS r.count = ROW_COUNT;
-            RAISE NOTICE 'Deleted % rows from session_data', r.count;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from session_data', deleted_count;
 
             DELETE FROM revenue WHERE created_at < cutoff;
-            GET DIAGNOSTICS r.count = ROW_COUNT;
-            RAISE NOTICE 'Deleted % rows from revenue', r.count;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from revenue', deleted_count;
 
             DELETE FROM website_event WHERE created_at < cutoff;
-            GET DIAGNOSTICS r.count = ROW_COUNT;
-            RAISE NOTICE 'Deleted % rows from website_event', r.count;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from website_event', deleted_count;
 
             DELETE FROM session WHERE created_at < cutoff;
-            GET DIAGNOSTICS r.count = ROW_COUNT;
-            RAISE NOTICE 'Deleted % rows from session', r.count;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from session', deleted_count;
           END $$;
           SQL
 
