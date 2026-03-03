@@ -45,4 +45,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
         run: |
-          psql "$DATABASE_URL" -c "VACUUM website_event, event_data, session_data, session, revenue;"
+          psql "$DATABASE_URL" -c "VACUUM FULL website_event;"
+          psql "$DATABASE_URL" -c "VACUUM FULL event_data;"
+          psql "$DATABASE_URL" -c "VACUUM FULL session;"
+          psql "$DATABASE_URL" -c "VACUUM FULL session_data;"
+          psql "$DATABASE_URL" -c "VACUUM FULL revenue;"
