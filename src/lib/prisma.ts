@@ -373,7 +373,10 @@ function getClient() {
   const logQuery = process.env.LOG_QUERY;
   const schema = getSchema();
 
-  const baseAdapter = new PrismaPg({ connectionString: url }, { schema });
+  const baseAdapter = new PrismaPg(
+    { connectionString: url, max: 1, idleTimeoutMillis: 10_000 },
+    { schema },
+  );
 
   const baseClient = new PrismaClient({
     adapter: baseAdapter,
@@ -391,7 +394,10 @@ function getClient() {
     return baseClient;
   }
 
-  const replicaAdapter = new PrismaPg({ connectionString: replicaUrl }, { schema });
+  const replicaAdapter = new PrismaPg(
+    { connectionString: replicaUrl, max: 1, idleTimeoutMillis: 10_000 },
+    { schema },
+  );
 
   const replicaClient = new PrismaClient({
     adapter: replicaAdapter,
