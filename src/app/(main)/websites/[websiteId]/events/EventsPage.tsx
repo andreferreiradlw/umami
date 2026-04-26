@@ -19,7 +19,7 @@ import { EventsDataTable } from './EventsDataTable';
 const KEY_NAME = 'umami.events.tab';
 
 export function EventsPage({ websiteId }) {
-  const [tab, setTab] = useState(getItem(KEY_NAME) || 'chart');
+  const [tab, setTab] = useState(getItem(KEY_NAME) || 'activity');
   const { isAllTime } = useDateRange();
   const { t, labels, getErrorMessage } = useMessages();
   const { data, isLoading, isFetching, error } = useEventStatsQuery({
@@ -100,14 +100,14 @@ export function EventsPage({ websiteId }) {
           <TabPanel id="chart">
             <Column gap="6">
               <Column border="bottom" paddingBottom="6">
-                <EventsChart websiteId={websiteId} limit={50} />
+                <EventsChart websiteId={websiteId} limit={500} />
               </Column>
               <MetricsTable
                 websiteId={websiteId}
                 type="event"
                 title={t(labels.event)}
                 metric={t(labels.count)}
-                limit={50}
+                limit={500}
               />
             </Column>
           </TabPanel>

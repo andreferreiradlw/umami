@@ -43,7 +43,7 @@ async function relationalQuery(
     ${filterQuery}
     group by website_event.event_name, event_data.data_key
     order by 3 desc
-    limit 500
+    limit 5000
     `,
     queryParams,
     FUNCTION_NAME,
@@ -84,7 +84,7 @@ async function clickhouseQuery(
     ${filterQuery}
     group by event_name, data_key
     order by 1, 3 desc
-    limit 500
+    limit 5000
     `,
     queryParams,
     FUNCTION_NAME,
