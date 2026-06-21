@@ -6,6 +6,7 @@ const IP = '127.0.0.1';
 
 afterEach(() => {
   delete process.env.IGNORE_SCREEN;
+  delete process.env.BLOCK_SQUARE_SCREENS;
 });
 
 test('hasBlockedScreen: blocks a listed resolution', () => {
@@ -35,6 +36,32 @@ test('hasBlockedScreen: allows undefined screen', () => {
 
 test('hasBlockedScreen: no-op when IGNORE_SCREEN is unset', () => {
   expect(hasBlockedScreen('1280x1200')).toBe(false);
+});
+
+test('hasBlockedScreen: blocks near-square resolutions when BLOCK_SQUARE_SCREENS is set', () => {
+  process.env.BLOCK_SQUARE_SCREENS = 'true';
+
+  expect(hasBlockedScreen('1366x1366')).toBe(true);
+  expect(hasBlockedScreen('1265x1212')).toBe(true);
+  expect(hasBlockedScreen('1332x1326')).toBe(true);
+});
+
+test('hasBlockedScreen: allows real (non-square) resolutions when BLOCK_SQUARE_SCREENS is set', () => {
+  process.env.BLOCK_SQUARE_SCREENS = 'true';
+
+  expect(hasBlockedScreen('1920x1080')).toBe(false);
+  expect(hasBlockedScreen('1280x1024')).toBe(false); // real 5:4 monitor
+  expect(hasBlockedScreen('1536x864')).toBe(false);
+});
+
+test('hasBlockedScreen: ignores small square resolutions below the size threshold', () => {
+  process.env.BLOCK_SQUARE_SCREENS = 'true';
+
+  expect(hasBlockedScreen('800x800')).toBe(false);
+});
+
+test('hasBlockedScreen: near-square no-op when BLOCK_SQUARE_SCREENS is unset', () => {
+  expect(hasBlockedScreen('1366x1366')).toBe(false);
 });
 
 test('getIpAddress: Custom header', () => {
