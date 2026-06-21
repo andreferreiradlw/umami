@@ -169,14 +169,42 @@ export function hasBlockedIp(clientIp: string) {
   return false;
 }
 
+const SQUARE_SCREEN_MIN = 1000;
+const SQUARE_SCREEN_RATIO = 0.1;
+
+// Near-square desktop resolutions (width ≈ height at >= SQUARE_SCREEN_MIN px) are a
+// strong bot signal: real displays are effectively never square at this size, while
+// bots frequently report randomized square-ish viewports. Enabled via BLOCK_SQUARE_SCREENS.
+function isNearSquareScreen(screen: string) {
+  const match = /^(\d+)x(\d+)$/.exec(screen);
+
+  if (!match) {
+    return false;
+  }
+
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+
+  if (width < SQUARE_SCREEN_MIN || height < SQUARE_SCREEN_MIN) {
+    return false;
+  }
+
+  return Math.abs(width - height) / Math.max(width, height) <= SQUARE_SCREEN_RATIO;
+}
+
 export function hasBlockedScreen(screen?: string) {
+  if (!screen) {
+    return false;
+  }
+
   const ignoreScreens = process.env.IGNORE_SCREEN;
 
-  if (ignoreScreens && screen) {
-    return ignoreScreens
-      .split(',')
-      .map(s => s.trim())
-      .includes(screen);
+  if (ignoreScreens && ignoreScreens.split(',').map(s => s.trim()).includes(screen)) {
+    return true;
+  }
+
+  if (process.env.BLOCK_SQUARE_SCREENS && isNearSquareScreen(screen)) {
+    return true;
   }
 
   return false;
