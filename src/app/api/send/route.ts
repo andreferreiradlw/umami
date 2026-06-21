@@ -5,7 +5,7 @@ import { z } from 'zod';
 import clickhouse from '@/lib/clickhouse';
 import { COLLECTION_TYPE, EVENT_TYPE } from '@/lib/constants';
 import { getSalt, hash, secret, uuid } from '@/lib/crypto';
-import { getClientInfo, hasBlockedIp } from '@/lib/detect';
+import { getClientInfo, hasBlockedIp, hasBlockedScreen } from '@/lib/detect';
 import { createToken, parseToken } from '@/lib/jwt';
 import { fetchWebsite } from '@/lib/load';
 import { parseRequest } from '@/lib/request';
@@ -129,6 +129,11 @@ export async function POST(request: Request) {
 
     // Bot check
     if (!process.env.DISABLE_BOT_CHECK && isbot(userAgent)) {
+      return json({ beep: 'boop' });
+    }
+
+    // Screen resolution block (bot mitigation)
+    if (hasBlockedScreen(screen)) {
       return json({ beep: 'boop' });
     }
 

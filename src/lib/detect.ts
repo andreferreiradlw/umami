@@ -168,3 +168,16 @@ export function hasBlockedIp(clientIp: string) {
 
   return false;
 }
+
+export function hasBlockedScreen(screen?: string) {
+  const ignoreScreens = process.env.IGNORE_SCREEN;
+
+  if (ignoreScreens && screen) {
+    return ignoreScreens
+      .split(',')
+      .map(s => s.trim())
+      .includes(screen);
+  }
+
+  return false;
+}
