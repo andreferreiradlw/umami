@@ -1,9 +1,10 @@
 import { z } from 'zod';
 import { saveAuth } from '@/lib/auth';
 import { ROLES } from '@/lib/constants';
-import { secret } from '@/lib/crypto';
+import { hash, secret } from '@/lib/crypto';
 import { createSecureToken } from '@/lib/jwt';
 import { checkPassword } from '@/lib/password';
+import prisma from '@/lib/prisma';
 import redis from '@/lib/redis';
 import { parseRequest } from '@/lib/request';
 import { json, unauthorized } from '@/lib/response';
@@ -30,13 +31,28 @@ export async function POST(request: Request) {
   }
 
   const { id, role, createdAt } = user;
+  const cloudMode = !!process.env.CLOUD_MODE;
+
+  // Check if 2FA is enabled for this user
+  const twoFactor = !cloudMode
+    ? await prisma.client.twoFactorAuth.findUnique({ where: { userId: id } })
+    : null;
+
+  if (twoFactor?.isEnabled) {
+    const partialToken = createSecureToken({ userId: id, type: 'partial-auth' }, secret(), {
+      expiresIn: '5m',
+    });
+    return json({ requiresTwoFactor: true, partialToken });
+  }
+  // Bind token to password hash so a password change invalidates old tokens.
+  const pwd = hash(user.password);
 
   let token: string;
 
   if (redis.enabled) {
-    token = await saveAuth({ userId: id, role });
+    token = await saveAuth({ userId: id, role, pwd });
   } else {
-    token = createSecureToken({ userId: user.id, role }, secret());
+    token = createSecureToken({ userId: user.id, role, pwd }, secret());
   }
 
   const teams = await getAllUserTeams(id);
