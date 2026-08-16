@@ -33,6 +33,13 @@ jobs:
             GET DIAGNOSTICS deleted_count = ROW_COUNT;
             RAISE NOTICE 'Deleted % rows from event_data', deleted_count;
 
+            -- heatmap_event (added in v3.2.0) is event-shaped and carries its own
+            -- created_at, so it drives its own retention exactly like website_event.
+            -- It is high volume: one row per click or move, with coordinates.
+            DELETE FROM heatmap_event WHERE created_at < cutoff;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from heatmap_event', deleted_count;
+
             -- A session is only dead once it has no events left. Deleting by
             -- session.created_at strands events from long-lived visitors: a
             -- session row is stamped when the visitor is FIRST seen, and sessions
@@ -40,13 +47,28 @@ jobs:
             -- be removed while its later events survived as orphans. There are no
             -- foreign keys to catch that (schema.prisma sets relationMode =
             -- "prisma"), so it fails silently.
+            -- heatmap_event is checked too: a session with no website_event but
+            -- surviving heatmap rows would otherwise be removed and strand them,
+            -- reintroducing exactly the bug this delete exists to prevent.
             DELETE FROM session s
             WHERE s.created_at < cutoff
               AND NOT EXISTS (
                 SELECT 1 FROM website_event e WHERE e.session_id = s.session_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM heatmap_event h WHERE h.session_id = s.session_id
               );
             GET DIAGNOSTICS deleted_count = ROW_COUNT;
             RAISE NOTICE 'Deleted % rows from session', deleted_count;
+
+            -- session_link (added in v3.2.0) maps distinct_id to session; it is
+            -- meaningless once the session is gone.
+            DELETE FROM session_link l
+            WHERE NOT EXISTS (
+              SELECT 1 FROM session s WHERE s.session_id = l.session_id
+            );
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from session_link', deleted_count;
 
             DELETE FROM session_data d
             WHERE NOT EXISTS (
@@ -73,7 +95,9 @@ jobs:
           # the 03:00 Sunday slot is the lowest-traffic window.
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL website_event;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL event_data;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL heatmap_event;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session_link;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session_data;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL revenue;"
 
@@ -90,6 +114,8 @@ jobs:
           DECLARE
             orphan_events integer;
             orphan_data integer;
+            orphan_heatmap integer;
+            orphan_links integer;
           BEGIN
             SELECT count(*) INTO orphan_events
             FROM website_event e
@@ -103,12 +129,36 @@ jobs:
               SELECT 1 FROM website_event e WHERE e.event_id = d.website_event_id
             );
 
-            RAISE NOTICE 'Orphans: % website_event, % event_data', orphan_events, orphan_data;
+            SELECT count(*) INTO orphan_heatmap
+            FROM heatmap_event h
+            WHERE NOT EXISTS (
+              SELECT 1 FROM session s WHERE s.session_id = h.session_id
+            );
 
-            -- event_data is fully reference-deleted above, so any survivor is a
-            -- genuine regression.
+            SELECT count(*) INTO orphan_links
+            FROM session_link l
+            WHERE NOT EXISTS (
+              SELECT 1 FROM session s WHERE s.session_id = l.session_id
+            );
+
+            RAISE NOTICE 'Orphans: % website_event, % event_data, % heatmap_event, % session_link',
+              orphan_events, orphan_data, orphan_heatmap, orphan_links;
+
+            -- event_data and session_link are fully reference-deleted above, so any
+            -- survivor is a genuine regression.
             IF orphan_data > 0 THEN
               RAISE EXCEPTION 'Cleanup left % orphaned event_data rows', orphan_data;
+            END IF;
+
+            IF orphan_links > 0 THEN
+              RAISE EXCEPTION 'Cleanup left % orphaned session_link rows', orphan_links;
+            END IF;
+
+            -- heatmap_event shares website_event's tolerance: it is written by the
+            -- same /api/send session path and so hits the same cache-token race.
+            IF orphan_heatmap > 1000 THEN
+              RAISE EXCEPTION 'Cleanup left % orphaned heatmap_event rows (>1000 indicates a regression)',
+                orphan_heatmap;
             END IF;
 
             -- website_event tolerates a small number: /api/send skips session
