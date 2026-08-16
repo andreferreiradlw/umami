@@ -13,31 +13,54 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
         run: |
-          psql "$DATABASE_URL" <<'SQL'
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" <<'SQL'
           DO $$
           DECLARE
             cutoff timestamptz := NOW() - INTERVAL '3 months';
             deleted_count integer;
           BEGIN
-            DELETE FROM event_data WHERE created_at < cutoff;
-            GET DIAGNOSTICS deleted_count = ROW_COUNT;
-            RAISE NOTICE 'Deleted % rows from event_data', deleted_count;
-
-            DELETE FROM session_data WHERE created_at < cutoff;
-            GET DIAGNOSTICS deleted_count = ROW_COUNT;
-            RAISE NOTICE 'Deleted % rows from session_data', deleted_count;
-
-            DELETE FROM revenue WHERE created_at < cutoff;
-            GET DIAGNOSTICS deleted_count = ROW_COUNT;
-            RAISE NOTICE 'Deleted % rows from revenue', deleted_count;
-
+            -- Events drive retention: "3 months of data" is defined by event age.
             DELETE FROM website_event WHERE created_at < cutoff;
             GET DIAGNOSTICS deleted_count = ROW_COUNT;
             RAISE NOTICE 'Deleted % rows from website_event', deleted_count;
 
-            DELETE FROM session WHERE created_at < cutoff;
+            -- Child rows go by reference, not by their own timestamp, so nothing
+            -- can outlive the row it belongs to.
+            DELETE FROM event_data d
+            WHERE NOT EXISTS (
+              SELECT 1 FROM website_event e WHERE e.event_id = d.website_event_id
+            );
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from event_data', deleted_count;
+
+            -- A session is only dead once it has no events left. Deleting by
+            -- session.created_at strands events from long-lived visitors: a
+            -- session row is stamped when the visitor is FIRST seen, and sessions
+            -- here span up to 30 days, so one created just before the cutoff would
+            -- be removed while its later events survived as orphans. There are no
+            -- foreign keys to catch that (schema.prisma sets relationMode =
+            -- "prisma"), so it fails silently.
+            DELETE FROM session s
+            WHERE s.created_at < cutoff
+              AND NOT EXISTS (
+                SELECT 1 FROM website_event e WHERE e.session_id = s.session_id
+              );
             GET DIAGNOSTICS deleted_count = ROW_COUNT;
             RAISE NOTICE 'Deleted % rows from session', deleted_count;
+
+            DELETE FROM session_data d
+            WHERE NOT EXISTS (
+              SELECT 1 FROM session s WHERE s.session_id = d.session_id
+            );
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from session_data', deleted_count;
+
+            DELETE FROM revenue r
+            WHERE NOT EXISTS (
+              SELECT 1 FROM session s WHERE s.session_id = r.session_id
+            );
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from revenue', deleted_count;
           END $$;
           SQL
 
@@ -45,8 +68,58 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
         run: |
-          psql "$DATABASE_URL" -c "VACUUM FULL website_event;"
-          psql "$DATABASE_URL" -c "VACUUM FULL event_data;"
-          psql "$DATABASE_URL" -c "VACUUM FULL session;"
-          psql "$DATABASE_URL" -c "VACUUM FULL session_data;"
-          psql "$DATABASE_URL" -c "VACUUM FULL revenue;"
+          # VACUUM FULL takes an ACCESS EXCLUSIVE lock, so tracker writes to these
+          # tables fail (not queue) for its duration. Kept because disk is tight;
+          # the 03:00 Sunday slot is the lowest-traffic window.
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL website_event;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL event_data;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session_data;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL revenue;"
+
+      # Runs last so a regression here surfaces the problem without blocking the
+      # disk reclamation above. Orphaning is otherwise invisible: umami's
+      # dimensional reports join website_event to session and quietly drop
+      # orphans, while raw pageview counts do not join and still include them.
+      - name: Verify no orphaned rows remain
+        env:
+          DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: |
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" <<'SQL'
+          DO $$
+          DECLARE
+            orphan_events integer;
+            orphan_data integer;
+          BEGIN
+            SELECT count(*) INTO orphan_events
+            FROM website_event e
+            WHERE NOT EXISTS (
+              SELECT 1 FROM session s WHERE s.session_id = e.session_id
+            );
+
+            SELECT count(*) INTO orphan_data
+            FROM event_data d
+            WHERE NOT EXISTS (
+              SELECT 1 FROM website_event e WHERE e.event_id = d.website_event_id
+            );
+
+            RAISE NOTICE 'Orphans: % website_event, % event_data', orphan_events, orphan_data;
+
+            -- event_data is fully reference-deleted above, so any survivor is a
+            -- genuine regression.
+            IF orphan_data > 0 THEN
+              RAISE EXCEPTION 'Cleanup left % orphaned event_data rows', orphan_data;
+            END IF;
+
+            -- website_event tolerates a small number: /api/send skips session
+            -- creation whenever the client returns a cache token carrying a
+            -- sessionId (src/app/api/send/route.ts), so a visitor whose row was
+            -- removed can post events referencing it before the token expires.
+            -- Those age out on their own. A large count means the delete logic
+            -- regressed to removing sessions that still had events.
+            IF orphan_events > 1000 THEN
+              RAISE EXCEPTION 'Cleanup left % orphaned website_event rows (>1000 indicates a regression)',
+                orphan_events;
+            END IF;
+          END $$;
+          SQL
