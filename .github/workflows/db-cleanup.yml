@@ -2,8 +2,16 @@ name: Database Cleanup
 
 on:
   schedule:
-    - cron: '0 3 * * 0' # Every Sunday at 3:00 AM UTC
+    # Off the hour on purpose: GitHub queues top-of-hour schedules behind
+    # everyone else's, which pushed this job from 03:00 to as late as 09:50 UTC,
+    # into European morning traffic while VACUUM FULL holds its lock.
+    - cron: '17 3 * * 0' # Every Sunday at 03:17 UTC
   workflow_dispatch: # Allow manual trigger
+    inputs:
+      vacuum:
+        description: 'Also run VACUUM FULL (locks the tables; off-peak only)'
+        type: boolean
+        default: false
 
 jobs:
   cleanup:
@@ -18,6 +26,7 @@ jobs:
           DECLARE
             cutoff timestamptz := NOW() - INTERVAL '3 months';
             deleted_count integer;
+            stranded integer;
           BEGIN
             -- Events drive retention: "3 months of data" is defined by event age.
             DELETE FROM website_event WHERE created_at < cutoff;
@@ -35,33 +44,70 @@ jobs:
 
             -- heatmap_event (added in v3.2.0) is event-shaped and carries its own
             -- created_at, so it drives its own retention exactly like website_event.
-            -- It is high volume: one row per click or move, with coordinates.
+            -- It is high volume: one row per click or scroll, with coordinates.
             DELETE FROM heatmap_event WHERE created_at < cutoff;
             GET DIAGNOSTICS deleted_count = ROW_COUNT;
             RAISE NOTICE 'Deleted % rows from heatmap_event', deleted_count;
 
-            -- A session is only dead once it has no events left. Deleting by
-            -- session.created_at strands events from long-lived visitors: a
+            -- session_replay (added in v3.1.0) is retained the same way. Its chunks
+            -- are recorded DOM (BYTEA), the fastest way to fill the disk once
+            -- recording is enabled. A replay a user chose to keep is only a
+            -- pointer (session_replay_saved holds website_id, visit_id and a
+            -- name), so its chunks stay, and through them its session does too.
+            DELETE FROM session_replay r
+            WHERE r.created_at < cutoff
+              AND NOT EXISTS (
+                SELECT 1 FROM session_replay_saved sv
+                WHERE sv.website_id = r.website_id AND sv.visit_id = r.visit_id
+              );
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from session_replay', deleted_count;
+
+            -- A session is only dead once nothing references it any more. Deleting
+            -- by session.created_at strands events from long-lived visitors: a
             -- session row is stamped when the visitor is FIRST seen, and sessions
             -- here span up to 30 days, so one created just before the cutoff would
             -- be removed while its later events survived as orphans. There are no
             -- foreign keys to catch that (schema.prisma sets relationMode =
             -- "prisma"), so it fails silently.
-            -- heatmap_event is checked too: a session with no website_event but
-            -- surviving heatmap rows would otherwise be removed and strand them,
-            -- reintroducing exactly the bug this delete exists to prevent.
-            DELETE FROM session s
-            WHERE s.created_at < cutoff
-              AND NOT EXISTS (
-                SELECT 1 FROM website_event e WHERE e.session_id = s.session_id
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM heatmap_event h WHERE h.session_id = s.session_id
-              );
+            CREATE TEMP TABLE removed_session (session_id uuid PRIMARY KEY) ON COMMIT DROP;
+
+            WITH removed AS (
+              DELETE FROM session s
+              WHERE s.created_at < cutoff
+                AND NOT EXISTS (
+                  SELECT 1 FROM website_event e WHERE e.session_id = s.session_id
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM heatmap_event h WHERE h.session_id = s.session_id
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM session_replay r WHERE r.session_id = s.session_id
+                )
+              RETURNING s.session_id
+            )
+            INSERT INTO removed_session SELECT session_id FROM removed;
             GET DIAGNOSTICS deleted_count = ROW_COUNT;
             RAISE NOTICE 'Deleted % rows from session', deleted_count;
 
-            -- session_link (added in v3.2.0) maps distinct_id to session; it is
+            -- The predicate above makes this impossible for rows that existed when
+            -- it ran, which is the point: if it is ever loosened, raising here rolls
+            -- back every delete in this block, so the regression costs one red run
+            -- instead of silently stranded data. This check takes a newer snapshot,
+            -- so a row committed in between also trips it; the stock tracker cannot
+            -- write one (a session this old has last month's salt in its id), only
+            -- a backdated /api/send replaying its cache token could.
+            SELECT (SELECT count(*) FROM website_event e JOIN removed_session USING (session_id))
+                 + (SELECT count(*) FROM heatmap_event h JOIN removed_session USING (session_id))
+                 + (SELECT count(*) FROM session_replay r JOIN removed_session USING (session_id))
+            INTO stranded;
+
+            IF stranded > 0 THEN
+              RAISE EXCEPTION 'Session delete would strand % rows that still reference a removed session (a loosened predicate, or a concurrent backdated write); rolled back',
+                stranded;
+            END IF;
+
+            -- session_link (added in v3.3.0) maps distinct_id to session; it is
             -- meaningless once the session is gone.
             DELETE FROM session_link l
             WHERE NOT EXISTS (
@@ -77,8 +123,14 @@ jobs:
             GET DIAGNOSTICS deleted_count = ROW_COUNT;
             RAISE NOTICE 'Deleted % rows from session_data', deleted_count;
 
+            -- revenue belongs to an event as well as a session. Going by session
+            -- alone kept revenue for expired events alive as long as the session
+            -- had any newer event.
             DELETE FROM revenue r
             WHERE NOT EXISTS (
+              SELECT 1 FROM website_event e WHERE e.event_id = r.event_id
+            )
+            OR NOT EXISTS (
               SELECT 1 FROM session s WHERE s.session_id = r.session_id
             );
             GET DIAGNOSTICS deleted_count = ROW_COUNT;
@@ -87,24 +139,31 @@ jobs:
           SQL
 
       - name: Vacuum tables to reclaim disk space
+        # Scheduled runs always vacuum; a manual run only when asked, so a
+        # daytime run to check the job does not stall the tracker.
+        if: github.event_name == 'schedule' || inputs.vacuum
         env:
           DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
         run: |
-          # VACUUM FULL takes an ACCESS EXCLUSIVE lock, so tracker writes to these
-          # tables fail (not queue) for its duration. Kept because disk is tight;
-          # the 03:00 Sunday slot is the lowest-traffic window.
+          # VACUUM FULL takes an ACCESS EXCLUSIVE lock, so tracker writes to the
+          # table being rewritten queue behind it (website_event takes about a
+          # minute), each holding a pooler connection, and fail only if the wait
+          # outlives the 2-minute statement_timeout. Kept because disk is tight;
+          # Sunday early morning is the lowest-traffic window.
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL website_event;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL event_data;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL heatmap_event;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session_replay;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session_link;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session_data;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL revenue;"
 
-      # Runs last so a regression here surfaces the problem without blocking the
-      # disk reclamation above. Orphaning is otherwise invisible: umami's
-      # dimensional reports join website_event to session and quietly drop
-      # orphans, while raw pageview counts do not join and still include them.
+      # Runs last so a failure here does not block the disk reclamation above.
+      # The delete step already refuses to strand anything, so this step watches
+      # the other source of orphans: collection itself. Orphaning is otherwise
+      # invisible: umami's dimensional reports join website_event to session and
+      # quietly drop orphans, while totals do not join and still include them.
       - name: Verify no orphaned rows remain
         env:
           DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
@@ -112,21 +171,48 @@ jobs:
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" <<'SQL'
           DO $$
           DECLARE
-            orphan_events integer;
             orphan_data integer;
-            orphan_heatmap integer;
+            orphan_revenue integer;
             orphan_links integer;
+            orphan_session_data integer;
+            orphan_events integer;
+            orphan_heatmap integer;
+            orphan_replay integer;
+            new_orphan_sessions integer;
           BEGIN
-            SELECT count(*) INTO orphan_events
-            FROM website_event e
-            WHERE NOT EXISTS (
-              SELECT 1 FROM session s WHERE s.session_id = e.session_id
-            );
-
             SELECT count(*) INTO orphan_data
             FROM event_data d
             WHERE NOT EXISTS (
               SELECT 1 FROM website_event e WHERE e.event_id = d.website_event_id
+            );
+
+            SELECT count(*) INTO orphan_revenue
+            FROM revenue r
+            WHERE NOT EXISTS (
+              SELECT 1 FROM website_event e WHERE e.event_id = r.event_id
+            );
+
+            -- Only rows older than this run: identify calls replaying a token
+            -- issued before the drift fix can write these for a session that does
+            -- not exist, and one landing mid-run is not a cleanup failure.
+            SELECT count(*) INTO orphan_links
+            FROM session_link l
+            WHERE l.created_at < NOW() - INTERVAL '1 hour'
+              AND NOT EXISTS (
+                SELECT 1 FROM session s WHERE s.session_id = l.session_id
+              );
+
+            SELECT count(*) INTO orphan_session_data
+            FROM session_data d
+            WHERE d.created_at < NOW() - INTERVAL '1 hour'
+              AND NOT EXISTS (
+                SELECT 1 FROM session s WHERE s.session_id = d.session_id
+              );
+
+            SELECT count(*) INTO orphan_events
+            FROM website_event e
+            WHERE NOT EXISTS (
+              SELECT 1 FROM session s WHERE s.session_id = e.session_id
             );
 
             SELECT count(*) INTO orphan_heatmap
@@ -135,41 +221,66 @@ jobs:
               SELECT 1 FROM session s WHERE s.session_id = h.session_id
             );
 
-            SELECT count(*) INTO orphan_links
-            FROM session_link l
+            SELECT count(*) INTO orphan_replay
+            FROM session_replay r
             WHERE NOT EXISTS (
-              SELECT 1 FROM session s WHERE s.session_id = l.session_id
+              SELECT 1 FROM session s WHERE s.session_id = r.session_id
             );
 
-            RAISE NOTICE 'Orphans: % website_event, % event_data, % heatmap_event, % session_link',
-              orphan_events, orphan_data, orphan_heatmap, orphan_links;
+            RAISE NOTICE 'Orphans: % event_data, % revenue, % session_link, % session_data, % website_event, % heatmap_event, % session_replay',
+              orphan_data, orphan_revenue, orphan_links, orphan_session_data,
+              orphan_events, orphan_heatmap, orphan_replay;
 
-            -- event_data and session_link are fully reference-deleted above, so any
-            -- survivor is a genuine regression.
+            -- These are all deleted by reference above, and collection writes them
+            -- only after the row they reference, so any survivor is a regression.
             IF orphan_data > 0 THEN
               RAISE EXCEPTION 'Cleanup left % orphaned event_data rows', orphan_data;
+            END IF;
+
+            IF orphan_revenue > 0 THEN
+              RAISE EXCEPTION 'Cleanup left % orphaned revenue rows', orphan_revenue;
             END IF;
 
             IF orphan_links > 0 THEN
               RAISE EXCEPTION 'Cleanup left % orphaned session_link rows', orphan_links;
             END IF;
 
-            -- heatmap_event shares website_event's tolerance: it is written by the
-            -- same /api/send session path and so hits the same cache-token race.
-            IF orphan_heatmap > 1000 THEN
-              RAISE EXCEPTION 'Cleanup left % orphaned heatmap_event rows (>1000 indicates a regression)',
-                orphan_heatmap;
+            IF orphan_session_data > 0 THEN
+              RAISE EXCEPTION 'Cleanup left % orphaned session_data rows', orphan_session_data;
             END IF;
 
-            -- website_event tolerates a small number: /api/send skips session
-            -- creation whenever the client returns a cache token carrying a
-            -- sessionId (src/app/api/send/route.ts), so a visitor whose row was
-            -- removed can post events referencing it before the token expires.
-            -- Those age out on their own. A large count means the delete logic
-            -- regressed to removing sessions that still had events.
-            IF orphan_events > 1000 THEN
-              RAISE EXCEPTION 'Cleanup left % orphaned website_event rows (>1000 indicates a regression)',
-                orphan_events;
+            -- Event-shaped rows without a session come from collection, not from
+            -- this job. Up to v3.3.0, /api/send skipped creating the session
+            -- whenever the tracker sent a cache token, yet saved the event under a
+            -- session id recomputed from the visitor's IP, so an IP change mid-page
+            -- (mobile networks, VPNs) or the monthly salt rotation orphaned 38-112
+            -- sessions a week (upstream issue #4462, fixed in v3.3.1). A few can
+            -- still appear: a tab holding a token issued before the fix keeps its
+            -- id until it reloads, its IP changes or the month turns, and /api/record writes
+            -- heatmap and replay rows under the token's id as-is. So only the last
+            -- week counts: the total would keep a fixed leak red for the whole
+            -- retention window, and counting sessions rather than rows keeps one
+            -- busy heatmap from looking like a leak.
+            SELECT count(DISTINCT session_id) INTO new_orphan_sessions
+            FROM (
+              SELECT e.session_id FROM website_event e
+              WHERE e.created_at > NOW() - INTERVAL '7 days'
+              UNION ALL
+              SELECT h.session_id FROM heatmap_event h
+              WHERE h.created_at > NOW() - INTERVAL '7 days'
+              UNION ALL
+              SELECT r.session_id FROM session_replay r
+              WHERE r.created_at > NOW() - INTERVAL '7 days'
+            ) recent
+            WHERE NOT EXISTS (
+              SELECT 1 FROM session s WHERE s.session_id = recent.session_id
+            );
+
+            RAISE NOTICE 'Sessions orphaned in the last 7 days: %', new_orphan_sessions;
+
+            IF new_orphan_sessions > 20 THEN
+              RAISE EXCEPTION '% sessions were orphaned in the last 7 days (>20 means collection is creating events without sessions again)',
+                new_orphan_sessions;
             END IF;
           END $$;
           SQL
