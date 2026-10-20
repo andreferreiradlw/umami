@@ -1,22 +1,18 @@
-import { z } from 'zod';
 import { saveAuth } from '@/lib/auth';
-import { ROLES } from '@/lib/constants';
+import { PARTIAL_AUTH_TOKEN_TYPE, ROLES } from '@/lib/constants';
 import { hash, secret } from '@/lib/crypto';
 import { createSecureToken } from '@/lib/jwt';
 import { checkPassword } from '@/lib/password';
 import prisma from '@/lib/prisma';
 import redis from '@/lib/redis';
 import { parseRequest } from '@/lib/request';
-import { json, unauthorized } from '@/lib/response';
+import { json, serviceUnavailable, unauthorized } from '@/lib/response';
+import { getTwoFactorConfigurationError, isTwoFactorConfigured } from '@/lib/two-factor/crypto';
 import { getAllUserTeams, getUserByUsername } from '@/queries/prisma';
+import { loginRequestSchema } from './schema';
 
 export async function POST(request: Request) {
-  const schema = z.object({
-    username: z.string(),
-    password: z.string(),
-  });
-
-  const { body, error } = await parseRequest(request, schema, { skipAuth: true });
+  const { body, error } = await parseRequest(request, loginRequestSchema, { skipAuth: true });
 
   if (error) {
     return error();
@@ -39,9 +35,17 @@ export async function POST(request: Request) {
     : null;
 
   if (twoFactor?.isEnabled) {
-    const partialToken = createSecureToken({ userId: id, type: 'partial-auth' }, secret(), {
-      expiresIn: '5m',
-    });
+    if (!isTwoFactorConfigured()) {
+      return serviceUnavailable(getTwoFactorConfigurationError());
+    }
+
+    const partialToken = createSecureToken(
+      { userId: id, type: PARTIAL_AUTH_TOKEN_TYPE },
+      secret(),
+      {
+        expiresIn: '5m',
+      },
+    );
     return json({ requiresTwoFactor: true, partialToken });
   }
   // Bind token to password hash so a password change invalidates old tokens.
