@@ -284,3 +284,44 @@ jobs:
             END IF;
           END $$;
           SQL
+
+      # umami reaches the database only as postgres, which bypasses RLS, so none
+      # of this affects it. Supabase grants every new public table to its API
+      # roles, though, so each table a umami upgrade adds would otherwise be
+      # readable and writable through the Data API (which is also switched off
+      # for this project). Runs even when an earlier step failed.
+      - name: Keep umami tables closed to the Supabase Data API
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: |
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" <<'SQL'
+          BEGIN;
+          SET LOCAL lock_timeout = '5s';
+
+          DO $$
+          DECLARE
+            t regclass;
+          BEGIN
+            FOR t IN
+              SELECT c.oid::regclass
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public'
+                AND c.relkind IN ('r', 'p')
+                AND NOT c.relrowsecurity
+            LOOP
+              EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', t);
+              RAISE NOTICE 'Enabled row level security on %', t;
+            END LOOP;
+          END $$;
+
+          REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
+          REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated;
+          REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM anon, authenticated;
+          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated;
+          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public REVOKE ALL ON SEQUENCES FROM anon, authenticated;
+          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM anon, authenticated;
+
+          COMMIT;
+          SQL
