@@ -4,7 +4,7 @@ import { type CollectionCache, resolveIdentifiedSession } from '@/lib/collection
 import { CACHE_TOKEN_TYPE } from '@/lib/constants';
 import { withCorsHeaders } from '@/lib/cors';
 import { secret } from '@/lib/crypto';
-import { getClientInfo, hasBlockedIp } from '@/lib/detect';
+import { getClientInfo, hasBlockedIp, hasBlockedScreen } from '@/lib/detect';
 import { type ErrorIngestionOutcome, recordErrorIngestion } from '@/lib/errors/metrics';
 import type { ErrorPayload } from '@/lib/errors/schema';
 import { createToken, parseToken } from '@/lib/jwt';
@@ -69,6 +69,11 @@ export async function collectError(request: Request, payload: ErrorPayload) {
     const info = await getClientInfo(request, {});
     if (!process.env.DISABLE_BOT_CHECK && isbot(info.userAgent))
       return respond(json({ ok: false, reason: 'bot' }), 'blocked');
+    // Fork-local: the IGNORE_SCREEN / BLOCK_SQUARE_SCREENS filter from /api/send.
+    // Without it, a blocked client still gets a session row and a cache token here.
+    if (hasBlockedScreen(payload.screen)) {
+      return respond(json({ ok: false, reason: 'bot' }), 'blocked');
+    }
     if (hasBlockedIp(info.ip)) return respond(forbidden());
     if (!(await consumeErrorQuota(payload.website))) {
       return respond(

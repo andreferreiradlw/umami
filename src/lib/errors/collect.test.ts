@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   createSession: vi.fn(),
   findUnique: vi.fn(),
   getClientInfo: vi.fn(),
+  hasBlockedScreen: vi.fn(),
   recordErrorIngestion: vi.fn(),
   resolveIdentifiedSession: vi.fn(),
   saveError: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock('@/lib/crypto', () => ({ secret: () => 'secret' }));
 vi.mock('@/lib/detect', () => ({
   getClientInfo: mocks.getClientInfo,
   hasBlockedIp: () => false,
+  hasBlockedScreen: mocks.hasBlockedScreen,
 }));
 vi.mock('@/lib/errors/metrics', () => ({ recordErrorIngestion: mocks.recordErrorIngestion }));
 vi.mock('@/lib/jwt', () => ({ createToken: () => 'cache-token', parseToken: vi.fn() }));
@@ -45,6 +47,7 @@ beforeEach(() => {
     resetAt: null,
   });
   mocks.getClientInfo.mockResolvedValue({ ip: '127.0.0.1', userAgent: 'Mozilla/5.0' });
+  mocks.hasBlockedScreen.mockReturnValue(false);
   mocks.resolveIdentifiedSession.mockResolvedValue({
     sessionId: '00000000-0000-4000-8000-000000000002',
     visitId: '00000000-0000-4000-8000-000000000003',
@@ -126,5 +129,19 @@ test('rejects errors that occurred before the website was reset', async () => {
   const response = await collectError(createRequest(old), old);
 
   expect(response.status).toBe(400);
+  expect(mocks.saveError).not.toHaveBeenCalled();
+});
+
+// Fork-local: the screen filter that guards /api/send must also guard this path,
+// or a blocked client still gets a session row and a cache token.
+test('drops errors from blocked screen resolutions before writing anything', async () => {
+  mocks.hasBlockedScreen.mockReturnValueOnce(true);
+  const square = { ...payload, screen: '1366x1366' };
+
+  const response = await collectError(createRequest(square), square);
+
+  expect(await response.json()).toEqual({ ok: false, reason: 'bot' });
+  expect(mocks.hasBlockedScreen).toHaveBeenCalledWith('1366x1366');
+  expect(mocks.createSession).not.toHaveBeenCalled();
   expect(mocks.saveError).not.toHaveBeenCalled();
 });
