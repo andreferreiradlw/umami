@@ -25,3 +25,17 @@ if (!process.env.SKIP_DB_CHECK && !process.env.DATABASE_TYPE) {
 if (process.env.CLOUD_URL) {
   checkMissing(['CLOUD_URL', 'CLICKHOUSE_URL', 'REDIS_URL']);
 }
+
+// Fork-local: since v3.5.0 every server route throws without APP_SECRET
+// (src/lib/app-secret.ts), but `next build` skips that check. On Vercel the
+// build would go green, check:db would migrate production, and the deployment
+// would then return 500 on every route, /api/send included. Fail here, before
+// check:db runs, instead.
+if (process.env.VERCEL) {
+  const appSecret = process.env.APP_SECRET?.trim();
+
+  if (!appSecret || appSecret === 'replace-me-with-a-random-string') {
+    console.log('APP_SECRET must be set in the Vercel environment for this deployment.');
+    process.exit(1);
+  }
+}
