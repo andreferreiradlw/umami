@@ -63,6 +63,29 @@ jobs:
             GET DIAGNOSTICS deleted_count = ROW_COUNT;
             RAISE NOTICE 'Deleted % rows from session_replay', deleted_count;
 
+            -- error_event (added in v3.5.0) is event-shaped and carries its own
+            -- created_at (the client's timestamp), so it drives its own retention
+            -- like website_event. Rows are large: up to 16 KB of stack plus the
+            -- parsed frames as JSONB. The server accepts errors for any website
+            -- whether or not the tracker sends them (data-errors).
+            DELETE FROM error_event WHERE created_at < cutoff;
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from error_event', deleted_count;
+
+            -- error_issue is one row per fingerprint plus its triage status, and
+            -- the issue list only shows issues that still have events. Ignored
+            -- issues stay: issue_id is derived from the fingerprint, so deleting
+            -- one would bring the error back as unresolved the next time it fired.
+            DELETE FROM error_issue i
+            WHERE i.created_at < cutoff
+              AND i.status <> 'ignored'
+              AND NOT EXISTS (
+                SELECT 1 FROM error_event x
+                WHERE x.website_id = i.website_id AND x.issue_id = i.issue_id
+              );
+            GET DIAGNOSTICS deleted_count = ROW_COUNT;
+            RAISE NOTICE 'Deleted % rows from error_issue', deleted_count;
+
             -- A session is only dead once nothing references it any more. Deleting
             -- by session.created_at strands events from long-lived visitors: a
             -- session row is stamped when the visitor is FIRST seen, and sessions
@@ -84,6 +107,9 @@ jobs:
                 AND NOT EXISTS (
                   SELECT 1 FROM session_replay r WHERE r.session_id = s.session_id
                 )
+                AND NOT EXISTS (
+                  SELECT 1 FROM error_event x WHERE x.session_id = s.session_id
+                )
               RETURNING s.session_id
             )
             INSERT INTO removed_session SELECT session_id FROM removed;
@@ -100,6 +126,7 @@ jobs:
             SELECT (SELECT count(*) FROM website_event e JOIN removed_session USING (session_id))
                  + (SELECT count(*) FROM heatmap_event h JOIN removed_session USING (session_id))
                  + (SELECT count(*) FROM session_replay r JOIN removed_session USING (session_id))
+                 + (SELECT count(*) FROM error_event x JOIN removed_session USING (session_id))
             INTO stranded;
 
             IF stranded > 0 THEN
@@ -154,6 +181,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL event_data;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL heatmap_event;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session_replay;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL error_event;"
+          psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL error_issue;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session_link;"
           psql -v ON_ERROR_STOP=1 "$DATABASE_URL" -c "VACUUM FULL session_data;"
@@ -178,6 +207,7 @@ jobs:
             orphan_events integer;
             orphan_heatmap integer;
             orphan_replay integer;
+            orphan_errors integer;
             new_orphan_sessions integer;
           BEGIN
             SELECT count(*) INTO orphan_data
@@ -227,9 +257,15 @@ jobs:
               SELECT 1 FROM session s WHERE s.session_id = r.session_id
             );
 
-            RAISE NOTICE 'Orphans: % event_data, % revenue, % session_link, % session_data, % website_event, % heatmap_event, % session_replay',
+            SELECT count(*) INTO orphan_errors
+            FROM error_event x
+            WHERE NOT EXISTS (
+              SELECT 1 FROM session s WHERE s.session_id = x.session_id
+            );
+
+            RAISE NOTICE 'Orphans: % event_data, % revenue, % session_link, % session_data, % website_event, % heatmap_event, % session_replay, % error_event',
               orphan_data, orphan_revenue, orphan_links, orphan_session_data,
-              orphan_events, orphan_heatmap, orphan_replay;
+              orphan_events, orphan_heatmap, orphan_replay, orphan_errors;
 
             -- These are all deleted by reference above, and collection writes them
             -- only after the row they reference, so any survivor is a regression.
@@ -260,7 +296,10 @@ jobs:
             -- heatmap and replay rows under the token's id as-is. So only the last
             -- week counts: the total would keep a fixed leak red for the whole
             -- retention window, and counting sessions rather than rows keeps one
-            -- busy heatmap from looking like a leak.
+            -- busy heatmap from looking like a leak. error_event (v3.5.0) is
+            -- counted here rather than strictly: collection writes the session
+            -- first, but deleting a session in the dashboard leaves its error rows
+            -- behind (upstream's deleteSession does not touch error_event).
             SELECT count(DISTINCT session_id) INTO new_orphan_sessions
             FROM (
               SELECT e.session_id FROM website_event e
@@ -271,6 +310,9 @@ jobs:
               UNION ALL
               SELECT r.session_id FROM session_replay r
               WHERE r.created_at > NOW() - INTERVAL '7 days'
+              UNION ALL
+              SELECT x.session_id FROM error_event x
+              WHERE x.created_at > NOW() - INTERVAL '7 days'
             ) recent
             WHERE NOT EXISTS (
               SELECT 1 FROM session s WHERE s.session_id = recent.session_id
